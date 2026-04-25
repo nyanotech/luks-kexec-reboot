@@ -1,0 +1,326 @@
+#!/usr/bin/env bash
+
+# luks-kexec-reboot: stage an unattended kexec reboot of a LUKS-encrypted
+# Arch + systemd-boot + sd-encrypt host, without writing raw key material
+# to nonvolatile storage.
+
+set -euo pipefail
+
+PROG=${0##*/}
+
+KERNEL=""
+CMDLINE_OVERRIDE=""
+ENTRY_OVERRIDE=""
+CRYPTTAB="/etc/crypttab.initramfs"
+DRY_RUN=0
+ALLOW_UNENCRYPTED_SWAP=0
+declare -a INITRD_OVERRIDES=()
+
+WORKDIR=""
+PASS=""
+declare -a NAMES=()
+declare -a DEVICES=()
+declare -a SRCS=()
+declare -a OPTIONS=()
+declare -a INITRD_IMAGES=()
+BASE_CMDLINE=""
+
+log()  { printf '%s\n' "$*" >&2; }
+die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+warn() { printf 'warning: %s\n' "$*" >&2; }
+
+usage() {
+    cat <<EOF
+Usage: $PROG [options]
+
+Options:
+  --kernel PATH       Override kernel image (default: systemd-boot default entry)
+  --initrd PATH       Override initrd (repeatable, concatenated in order given)
+  --cmdline STR       Override base kernel cmdline
+  --entry NAME        Select a specific systemd-boot entry instead of default
+  --crypttab PATH     Path to crypttab to read
+                      (default: /etc/crypttab.initramfs, falls back to /etc/crypttab)
+  --dry-run           Parse, build overlay, but do not touch LUKS or kexec
+  --allow-unencrypted-swap
+                      Proceed even if active swap is not on a dm-crypt device
+                      (default: refuse, since passphrase/keyfile pages may be
+                      swapped to disk)
+  -h, --help          Show this help
+EOF
+}
+
+cleanup() {
+    local rc=$?
+    set +e
+    # WORKDIR lives on /run (tmpfs), so rm is sufficient — shred on tmpfs
+    # doesn't overwrite backing pages in any useful way.
+    if [[ -n $WORKDIR && -d $WORKDIR ]]; then
+        rm -rf -- "$WORKDIR"
+    fi
+    PASS=""
+    exit "$rc"
+}
+trap cleanup EXIT INT TERM HUP QUIT
+
+parse_args() {
+    while (($#)); do
+        case $1 in
+            --kernel)    KERNEL=$2; shift 2 ;;
+            --initrd)    INITRD_OVERRIDES+=("$2"); shift 2 ;;
+            --cmdline)   CMDLINE_OVERRIDE=$2; shift 2 ;;
+            --entry)     ENTRY_OVERRIDE=$2; shift 2 ;;
+            --crypttab)  CRYPTTAB=$2; shift 2 ;;
+            --dry-run)   DRY_RUN=1; shift ;;
+            --allow-unencrypted-swap) ALLOW_UNENCRYPTED_SWAP=1; shift ;;
+            -h|--help)   usage; exit 0 ;;
+            *)           die "unknown option: $1" ;;
+        esac
+    done
+}
+
+preflight() {
+    [[ $EUID -eq 0 ]] || die "must run as root"
+    local b
+    for b in cryptsetup cpio kexec lsblk systemd-ask-password bootctl blkid; do
+        command -v "$b" >/dev/null || die "missing required tool: $b"
+    done
+    if [[ ! -s $CRYPTTAB && $CRYPTTAB == /etc/crypttab.initramfs && -s /etc/crypttab ]]; then
+        log "$CRYPTTAB missing; falling back to /etc/crypttab"
+        CRYPTTAB=/etc/crypttab
+    fi
+    [[ -s $CRYPTTAB ]] || die "$CRYPTTAB missing or empty"
+    [[ $(stat -f -c %T /run) == tmpfs ]] \
+        || die "/run is not tmpfs; refusing to write key material"
+    if [[ -r /sys/kernel/kexec_load_disabled ]]; then
+        [[ $(< /sys/kernel/kexec_load_disabled) == 0 ]] \
+            || die "kexec_load_disabled=1 in kernel; cannot load kexec image"
+    fi
+    # Refuse to run with unencrypted swap: passphrase and keyfile pages can
+    # be swapped to disk, defeating the point of not persisting key material.
+    local dev type line
+    while read -r line; do
+        [[ $line == Filename* ]] && continue
+        [[ -z $line ]] && continue
+        dev=${line%% *}
+        type=$(lsblk -ndo TYPE "$dev" 2>/dev/null || echo "")
+        if [[ -n $dev && $type != "crypt" ]]; then
+            if ((ALLOW_UNENCRYPTED_SWAP)); then
+                warn "active swap on $dev is not a dm-crypt device (proceeding due to --allow-unencrypted-swap)"
+            else
+                die "active swap on $dev is not a dm-crypt device; run 'swapoff -a' or pass --allow-unencrypted-swap"
+            fi
+        fi
+    done < /proc/swaps
+}
+
+parse_crypttab() {
+    local name src key opts resolved
+    # IFS restricted to space/tab so we don't eat embedded newlines; the
+    # `|| [[ -n $name ]]` tail catches a final line with no trailing newline.
+    while IFS=$' \t' read -r name src key opts || [[ -n ${name:-} ]]; do
+        # Strip a trailing CR in case the file has DOS line endings.
+        opts=${opts%$'\r'}
+        key=${key%$'\r'}
+        src=${src%$'\r'}
+        name=${name%$'\r'}
+        [[ -z ${name:-} || $name == \#* ]] && continue
+        # Skip entries that already use a real keyfile.
+        if [[ -n ${key:-} && $key != "none" && $key != "-" && $key != "/dev/urandom" ]]; then
+            log "skipping $name: already uses keyfile $key"
+            continue
+        fi
+        case $src in
+            UUID=*|PARTUUID=*|LABEL=*|PARTLABEL=*)
+                resolved=$(blkid -t "$src" -o device | head -n1) \
+                    || die "cannot resolve $src" ;;
+            /*) resolved=$src ;;
+            *)  die "unsupported source in crypttab: $src" ;;
+        esac
+        [[ -b $resolved ]] || die "not a block device: $resolved"
+        cryptsetup isLuks "$resolved" \
+            || die "$resolved is not a LUKS device"
+        NAMES+=("$name")
+        DEVICES+=("$resolved")
+        SRCS+=("$src")
+        OPTIONS+=("${opts:-luks}")
+    done < "$CRYPTTAB"
+    ((${#NAMES[@]} > 0)) || die "no usable entries in $CRYPTTAB"
+}
+
+# Populate KERNEL, INITRD_IMAGES, BASE_CMDLINE from systemd-boot or overrides.
+pick_boot_entry() {
+    # Apply overrides first; fall back to bootctl for anything still unset.
+    if [[ -n $KERNEL && ${#INITRD_OVERRIDES[@]} -gt 0 && -n $CMDLINE_OVERRIDE ]]; then
+        INITRD_IMAGES=("${INITRD_OVERRIDES[@]}")
+        BASE_CMDLINE=$CMDLINE_OVERRIDE
+        return
+    fi
+
+    local json entry_filter
+    json=$(bootctl list --json=short 2>/dev/null) \
+        || die "bootctl list --json=short failed; pass --kernel/--initrd/--cmdline"
+
+    local -a jq_args
+    if [[ -n $ENTRY_OVERRIDE ]]; then
+        # shellcheck disable=SC2016  # $id is a jq variable, not shell
+        entry_filter='.[] | select(.id==$id)'
+        jq_args=(--arg id "$ENTRY_OVERRIDE")
+    else
+        entry_filter='.[] | select(.isDefault==true)'
+        jq_args=()
+    fi
+
+    local linux initrds options
+    linux=$(printf '%s' "$json" | jq -r "${jq_args[@]}" "$entry_filter | .linux // empty")
+    options=$(printf '%s' "$json" | jq -r "${jq_args[@]}" "$entry_filter | .options // empty")
+    mapfile -t initrds < <(printf '%s' "$json" | jq -r "${jq_args[@]}" "$entry_filter | .initrd[]? // empty")
+
+    [[ -n $linux ]] || die "could not determine kernel from bootctl; pass --kernel"
+    [[ -n $options ]] || die "could not determine cmdline from bootctl; pass --cmdline"
+    ((${#initrds[@]} > 0)) || die "could not determine initrd from bootctl; pass --initrd"
+
+    # bootctl reports paths relative to the ESP root (e.g. /vmlinuz-linux).
+    # systemd-boot mounts the ESP at /efi or /boot; resolve by trying both.
+    local esp
+    for esp in /efi /boot; do
+        [[ -f $esp$linux ]] && { linux=$esp$linux; break; }
+    done
+    [[ -f $linux ]] || die "kernel not found: $linux"
+
+    local i p
+    for i in "${!initrds[@]}"; do
+        p=${initrds[$i]}
+        if [[ ! -f $p ]]; then
+            for esp in /efi /boot; do
+                if [[ -f $esp$p ]]; then p=$esp$p; break; fi
+            done
+        fi
+        [[ -f $p ]] || die "initrd not found: ${initrds[$i]}"
+        initrds[i]=$p
+    done
+
+    KERNEL=${KERNEL:-$linux}
+    BASE_CMDLINE=${CMDLINE_OVERRIDE:-$options}
+    if ((${#INITRD_OVERRIDES[@]} > 0)); then
+        INITRD_IMAGES=("${INITRD_OVERRIDES[@]}")
+    else
+        INITRD_IMAGES=("${initrds[@]}")
+    fi
+}
+
+prompt_passphrase() {
+    PASS=$(systemd-ask-password --no-tty "LUKS passphrase: ") \
+        || die "no passphrase entered"
+    [[ -n $PASS ]] || die "empty passphrase"
+}
+
+# Add an ephemeral keyslot on each device using KEYFILE, at slot 7.
+add_keyslots() {
+    local keyfile=$1
+    local i dev slot=7
+    for i in "${!DEVICES[@]}"; do
+        dev=${DEVICES[$i]}
+        # Always use slot 7. Kill it first in case a prior run left one behind,
+        # then re-add at the same index so the keyfile matches.
+        cryptsetup luksKillSlot --batch-mode "$dev" "$slot" >/dev/null 2>&1 || true
+        printf '%s' "$PASS" | cryptsetup luksAddKey \
+            --key-file=- --batch-mode --key-slot "$slot" \
+            "$dev" "$keyfile" \
+            || die "luksAddKey failed on $dev (wrong passphrase?)"
+        ADDED_SLOTS+=("$dev:$slot")
+        log "added keyslot $slot on $dev (${NAMES[$i]})"
+    done
+    # Slot selection logic below disabled in favor of fixed slot 7.
+    # local before after
+    # before=$(cryptsetup luksDump "$dev" | awk '/^  [0-9]+: luks2/{print $1}' | tr -d :)
+    # after=$(cryptsetup luksDump "$dev" | awk '/^  [0-9]+: luks2/{print $1}' | tr -d :)
+    # slot=$(comm -13 <(printf '%s\n' "$before" | sort) <(printf '%s\n' "$after" | sort) | head -n1)
+    # [[ -n $slot ]] || die "could not determine new slot index on $dev"
+}
+
+build_overlay_cpio() {
+    local overlay=$WORKDIR/overlay
+    install -d -m 0700 "$overlay/etc" "$overlay/etc/cryptsetup-keys.d"
+    local keyfile=$overlay/etc/cryptsetup-keys.d/kexec.key
+    install -m 0400 /dev/null "$keyfile"
+    dd if=/dev/urandom of="$keyfile" bs=64 count=1 status=none
+
+    local crypttab=$overlay/etc/crypttab
+    install -m 0600 /dev/null "$crypttab"
+    local i
+    for i in "${!NAMES[@]}"; do
+        printf '%s %s /etc/cryptsetup-keys.d/kexec.key %s\n' \
+            "${NAMES[$i]}" "${SRCS[$i]}" "${OPTIONS[$i]}" >> "$crypttab"
+    done
+
+    ( cd "$overlay" && find . -mindepth 1 -print0 \
+        | cpio --null -o -H newc --owner=0:0 --quiet ) \
+        > "$WORKDIR/overlay.cpio"
+    printf '%s' "$keyfile"
+}
+
+concat_initrd() {
+    # Overlay goes LAST. The kernel extracts concatenated archives in
+    # order, and later files overwrite earlier ones — so to override
+    # /etc/crypttab baked into the main initrd, our overlay must be
+    # extracted after it.
+    cat "${INITRD_IMAGES[@]}" "$WORKDIR/overlay.cpio" > "$WORKDIR/combined.img"
+}
+
+build_cmdline() {
+    # The overlay ships /etc/crypttab with the keyfile already wired up,
+    # so any rd.luks.* on the cmdline is at best redundant and at worst
+    # causes the systemd-cryptsetup generator to synthesize units that
+    # conflict with ours. Strip the whole family and let /etc/crypttab
+    # be authoritative.
+    printf '%s' "$BASE_CMDLINE" \
+        | tr ' ' '\n' \
+        | grep -v '^rd\.luks\.' \
+        | paste -sd ' ' -
+}
+
+kexec_load() {
+    local cmdline=$1
+    kexec -s -l "$KERNEL" \
+        --initrd="$WORKDIR/combined.img" \
+        --command-line="$cmdline"
+}
+
+main() {
+    umask 0077
+
+    parse_args "$@"
+    preflight
+    parse_crypttab
+    pick_boot_entry
+
+    WORKDIR=$(mktemp -d -p /run "luks-kexec-reboot.XXXXXX")
+
+    build_overlay_cpio > /dev/null
+    concat_initrd
+    local cmdline
+    cmdline=$(build_cmdline)
+
+    if ((DRY_RUN)); then
+        log "dry-run: kernel=$KERNEL"
+        log "dry-run: initrd images: ${INITRD_IMAGES[*]}"
+        log "dry-run: combined size: $(stat -c %s "$WORKDIR/combined.img") bytes"
+        log "dry-run: cmdline: $cmdline"
+        log "dry-run: would add keyslots on: ${DEVICES[*]}"
+        return 0
+    fi
+
+    prompt_passphrase
+    add_keyslots "$WORKDIR/overlay/etc/cryptsetup-keys.d/kexec.key"
+
+    # log "cmdline: $cmdline"
+    # log "workdir: $WORKDIR (paused — inspect, then press enter)"
+    # read -r _
+    kexec_load "$cmdline" || die "kexec -l failed"
+
+    log ""
+    log "Kexec image loaded. To reboot into it:  systemctl kexec"
+    log "To cancel:                              kexec -u"
+}
+
+main "$@"
