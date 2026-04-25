@@ -4,6 +4,18 @@
 # Arch + systemd-boot + sd-encrypt host, without writing raw key material
 # to nonvolatile storage.
 
+# TODO: auto-pick the lowest free LUKS keyslot instead of hardcoding slot 7.
+#       Disabled detection logic is still present below in add_keyslots.
+# TODO: clean up the added keyslot after the kexec'd boot (e.g. a oneshot
+#       unit on the target side that luksKillSlots it on first boot). Until
+#       then the keyfile is zeroed from RAM but the slot stays populated.
+# TODO: support kexec secure-boot signing for hosts that require signed images.
+# TODO: validate the passphrase (cryptsetup open --test-passphrase against the
+#       first device) before doing any setup work, so a typo fails fast.
+# TODO: parallelize add_keyslots across devices — each luksAddKey runs the
+#       header KDF, which is intentionally slow, so a host with several LUKS
+#       volumes spends most of its setup time waiting serially.
+
 set -euo pipefail
 
 PROG=${0##*/}
@@ -16,6 +28,8 @@ DRY_RUN=0
 ALLOW_UNENCRYPTED_SWAP=0
 declare -a INITRD_OVERRIDES=()
 
+LOCKFILE="/run/luks-kexec-reboot.lock"
+LOCK_FD=""
 WORKDIR=""
 PASS=""
 declare -a NAMES=()
@@ -81,7 +95,7 @@ parse_args() {
 preflight() {
     [[ $EUID -eq 0 ]] || die "must run as root"
     local b
-    for b in cryptsetup cpio kexec lsblk systemd-ask-password bootctl blkid; do
+    for b in cryptsetup cpio kexec lsblk systemd-ask-password bootctl blkid flock; do
         command -v "$b" >/dev/null || die "missing required tool: $b"
     done
     if [[ ! -s $CRYPTTAB && $CRYPTTAB == /etc/crypttab.initramfs && -s /etc/crypttab ]]; then
@@ -208,6 +222,16 @@ pick_boot_entry() {
     fi
 }
 
+acquire_lock() {
+    # Hold an exclusive flock for the lifetime of this process so two
+    # concurrent runs can't race on the same keyslot. The lockfile lives on
+    # /run (tmpfs), so it's recreated each boot — no stale-PID handling needed.
+    # The kernel drops the lock automatically on exit.
+    exec {LOCK_FD}>"$LOCKFILE" || die "cannot open $LOCKFILE"
+    flock -n "$LOCK_FD" \
+        || die "another $PROG is already running (lock held on $LOCKFILE)"
+}
+
 prompt_passphrase() {
     PASS=$(systemd-ask-password --no-tty "LUKS passphrase: ") \
         || die "no passphrase entered"
@@ -291,6 +315,7 @@ main() {
 
     parse_args "$@"
     preflight
+    acquire_lock
     parse_crypttab
     pick_boot_entry
 
