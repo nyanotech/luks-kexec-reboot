@@ -288,7 +288,18 @@ concat_initrd() {
     # order, and later files overwrite earlier ones — so to override
     # /etc/crypttab baked into the main initrd, our overlay must be
     # extracted after it.
-    cat "${INITRD_IMAGES[@]}" "$WORKDIR/overlay.cpio" > "$WORKDIR/combined.img"
+    #
+    # Because of Reasons, concatenated uncompressed cpios need to be aligned
+    # on a 4-byte boundary for the kernel to properly load them, so we pad the
+    # space between the original initramfs and our addition.
+    cat "${INITRD_IMAGES[@]}" > "$WORKDIR/combined.img"
+    local size pad
+    size=$(stat -c %s "$WORKDIR/combined.img")
+    pad=$(( (-size) & 3 ))
+    if ((pad)); then
+        head -c "$pad" /dev/zero >> "$WORKDIR/combined.img"
+    fi
+    cat "$WORKDIR/overlay.cpio" >> "$WORKDIR/combined.img"
 }
 
 build_cmdline() {
