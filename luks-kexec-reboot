@@ -26,6 +26,7 @@ ENTRY_OVERRIDE=""
 CRYPTTAB="/etc/crypttab.initramfs"
 DRY_RUN=0
 ALLOW_UNENCRYPTED_SWAP=0
+KEYSLOT=7
 declare -a INITRD_OVERRIDES=()
 
 LOCKFILE="/run/luks-kexec-reboot.lock"
@@ -238,23 +239,22 @@ prompt_passphrase() {
     [[ -n $PASS ]] || die "empty passphrase"
 }
 
-# Add an ephemeral keyslot on each device using KEYFILE, at slot 7.
+# Add an ephemeral keyslot on each device using KEYFILE, at $KEYSLOT.
 add_keyslots() {
     local keyfile=$1
-    local i dev slot=7
+    local i dev
     for i in "${!DEVICES[@]}"; do
         dev=${DEVICES[$i]}
-        # Always use slot 7. Kill it first in case a prior run left one behind,
-        # then re-add at the same index so the keyfile matches.
-        cryptsetup luksKillSlot --batch-mode "$dev" "$slot" >/dev/null 2>&1 || true
+        # Always use $KEYSLOT. Kill it first in case a prior run left one
+        # behind, then re-add at the same index so the keyfile matches.
+        cryptsetup luksKillSlot --batch-mode "$dev" "$KEYSLOT" >/dev/null 2>&1 || true
         printf '%s' "$PASS" | cryptsetup luksAddKey \
-            --key-file=- --batch-mode --key-slot "$slot" \
+            --key-file=- --batch-mode --key-slot "$KEYSLOT" \
             "$dev" "$keyfile" \
             || die "luksAddKey failed on $dev (wrong passphrase?)"
-        ADDED_SLOTS+=("$dev:$slot")
-        log "added keyslot $slot on $dev (${NAMES[$i]})"
+        log "added keyslot $KEYSLOT on $dev (${NAMES[$i]})"
     done
-    # Slot selection logic below disabled in favor of fixed slot 7.
+    # Slot selection logic below disabled in favor of fixed $KEYSLOT.
     # local before after
     # before=$(cryptsetup luksDump "$dev" | awk '/^  [0-9]+: luks2/{print $1}' | tr -d :)
     # after=$(cryptsetup luksDump "$dev" | awk '/^  [0-9]+: luks2/{print $1}' | tr -d :)
@@ -273,8 +273,10 @@ build_overlay_cpio() {
     install -m 0600 /dev/null "$crypttab"
     local i
     for i in "${!NAMES[@]}"; do
-        printf '%s %s /etc/cryptsetup-keys.d/kexec.key %s\n' \
-            "${NAMES[$i]}" "${SRCS[$i]}" "${OPTIONS[$i]}" >> "$crypttab"
+        # Pin key-slot so unlock runs the KDF once on $KEYSLOT instead of
+        # probing slots 0..($KEYSLOT-1) first.
+        printf '%s %s /etc/cryptsetup-keys.d/kexec.key %s,key-slot=%d\n' \
+            "${NAMES[$i]}" "${SRCS[$i]}" "${OPTIONS[$i]}" "$KEYSLOT" >> "$crypttab"
     done
 
     ( cd "$overlay" && find . -mindepth 1 -print0 \
