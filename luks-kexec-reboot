@@ -25,6 +25,7 @@ CMDLINE_OVERRIDE=""
 ENTRY_OVERRIDE=""
 CRYPTTAB="/etc/crypttab.initramfs"
 DRY_RUN=0
+DEBUG=0
 ALLOW_UNENCRYPTED_SWAP=0
 KEYSLOT=7
 declare -a INITRD_OVERRIDES=()
@@ -56,6 +57,8 @@ Options:
   --crypttab PATH     Path to crypttab to read
                       (default: /etc/crypttab.initramfs, falls back to /etc/crypttab)
   --dry-run           Parse, build overlay, but do not touch LUKS or kexec
+  --debug             Print the staged image details and pause before kexec -l
+                      so the overlay/keyslot can be inspected
   --allow-unencrypted-swap
                       Proceed even if active swap is not on a dm-crypt device
                       (default: refuse, since passphrase/keyfile pages may be
@@ -86,6 +89,7 @@ parse_args() {
             --entry)     ENTRY_OVERRIDE=$2; shift 2 ;;
             --crypttab)  CRYPTTAB=$2; shift 2 ;;
             --dry-run)   DRY_RUN=1; shift ;;
+            --debug)     DEBUG=1; shift ;;
             --allow-unencrypted-swap) ALLOW_UNENCRYPTED_SWAP=1; shift ;;
             -h|--help)   usage; exit 0 ;;
             *)           die "unknown option: $1" ;;
@@ -351,9 +355,21 @@ main() {
     prompt_passphrase
     add_keyslots "$WORKDIR/overlay/etc/cryptsetup-keys.d/kexec.key"
 
-    # log "cmdline: $cmdline"
-    # log "workdir: $WORKDIR (paused — inspect, then press enter)"
-    # read -r _
+    if ((DEBUG)); then
+        log ""
+        log "PAUSE — inspect, then press enter to load kexec image (Ctrl-C aborts)"
+        log "  cmdline: $cmdline"
+        log "  workdir: $WORKDIR"
+        log "  overlay cpio:    cpio -tv < $WORKDIR/overlay.cpio"
+        log "  combined initrd: ls -la $WORKDIR/combined.img"
+        log "  test the keyfile actually unlocks slot $KEYSLOT:"
+        for _i in "${!DEVICES[@]}"; do
+            log "    cryptsetup open --test-passphrase --key-slot $KEYSLOT \\"
+            log "      --key-file $WORKDIR/overlay/etc/cryptsetup-keys.d/kexec.key \\"
+            log "      ${DEVICES[$_i]}"
+        done
+        read -r _
+    fi
     kexec_load "$cmdline" || die "kexec -l failed"
 
     log ""

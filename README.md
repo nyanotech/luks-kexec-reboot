@@ -22,12 +22,13 @@ Right now, this thing only supports the configuration I made it for:
 Untested, but might work:
 
 - luks volumes that you normally open using a keyfile
-- having luks1 volumes in your crypttab
+- luks1 volumes
 
 Won't work (unimplemented):
 
 - volumes you unlock with something other than a passphrase or keyfile (eg,
   tpm)
+- volumes that use a detached LUKS header (`header=` in crypttab)
 - signing for kexec secure boot
 
 **Do not use this** if you are:
