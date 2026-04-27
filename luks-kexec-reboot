@@ -116,6 +116,10 @@ preflight() {
     fi
     # Refuse to run with unencrypted swap: passphrase and keyfile pages can
     # be swapped to disk, defeating the point of not persisting key material.
+    #
+    # Note: swapfiles on encrypted filesystems are also safe, but we don't try
+    # to resolve file -> fs -> backing device, so they get a false positive.
+    # Use --allow-unencrypted-swap if you know the backing device is encrypted.
     local dev type line
     while read -r line; do
         [[ $line == Filename* ]] && continue
@@ -252,8 +256,15 @@ add_keyslots() {
         # Always use $KEYSLOT. Kill it first in case a prior run left one
         # behind, then re-add at the same index so the keyfile matches.
         cryptsetup luksKillSlot --batch-mode "$dev" "$KEYSLOT" >/dev/null 2>&1 || true
+        # Use minimum difficulty values for argon2id for speed. This is safe
+        # because the key used is a 512 bit random keyfile, and not a password
+        # that needs kdf stretching.
         printf '%s' "$PASS" | cryptsetup luksAddKey \
             --key-file=- --batch-mode --key-slot "$KEYSLOT" \
+            --pbkdf argon2id \
+            --pbkdf-force-iterations 4 \
+            --pbkdf-memory 32 \
+            --pbkdf-parallel 1 \
             "$dev" "$keyfile" \
             || die "luksAddKey failed on $dev (wrong passphrase?)"
         log "added keyslot $KEYSLOT on $dev (${NAMES[$i]})"
@@ -271,7 +282,7 @@ build_overlay_cpio() {
     install -d -m 0700 "$overlay/etc" "$overlay/etc/cryptsetup-keys.d"
     local keyfile=$overlay/etc/cryptsetup-keys.d/kexec.key
     install -m 0400 /dev/null "$keyfile"
-    dd if=/dev/urandom of="$keyfile" bs=64 count=1 status=none
+    dd if=/dev/urandom of="$keyfile" bs=512 count=8 status=none
 
     local crypttab=$overlay/etc/crypttab
     install -m 0600 /dev/null "$crypttab"
